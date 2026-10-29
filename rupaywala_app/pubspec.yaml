@@ -1,0 +1,48 @@
+name: rupaywala_app
+description: A Flutter application for Rupaywala services.
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # HTTP requests (FastAPI communication)
+  http: ^1.2.0
+
+  # State management
+  provider: ^6.1.2
+
+  # Secure storage for JWT token
+  flutter_secure_storage: ^9.0.0
+
+  # Navigation system
+  go_router: ^13.2.0
+
+  # QR code display
+  qr_flutter: ^4.1.0
+
+  # Open UPI apps
+  url_launcher: ^6.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+
+flutter:
+
+  uses-material-design: true
+
+  # Assets for the application
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/
