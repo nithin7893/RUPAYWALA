@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.sql import func
+from sqlalchemy import text
 
 from app.database import Base
 
@@ -92,4 +93,30 @@ class Payment(Base):
         Index("idx_payments_user_plan", "user_id", "plan_id"),
         Index("idx_payments_status", "status"),
         Index("idx_payments_type_status", "payment_type", "status"),
+        # One open intent per (customer, payment type, idempotency key). The key
+        # is user-scoped, so a key can never resolve to another customer's
+        # payment; terminal rows are excluded so a retry can create a new intent.
+        Index(
+            "uq_payments_user_type_idem_open",
+            "user_id",
+            "payment_type",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text(
+                "idempotency_key IS NOT NULL "
+                "AND status IN ('pending', 'pending_verification')"
+            ),
+        ),
+        # At most one payable extra-charge intent per service request. Failed,
+        # expired and cancelled rows are excluded so legitimate retries work.
+        Index(
+            "uq_payments_open_extra_charge_request",
+            "related_request_id",
+            unique=True,
+            postgresql_where=text(
+                "payment_type = 'extra_charge' "
+                "AND related_request_id IS NOT NULL "
+                "AND status IN ('pending', 'pending_verification')"
+            ),
+        ),
     )

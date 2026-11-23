@@ -17,6 +17,8 @@ from app.database import Base
 import app.models.branch  # noqa: F401
 import app.models.customer_profile  # noqa: F401
 import app.models.distance_rate_config  # noqa: F401
+import app.models.document_audit_log  # noqa: F401
+import app.models.document_record  # noqa: F401
 import app.models.family_member  # noqa: F401
 import app.models.field_member  # noqa: F401
 import app.models.notification  # noqa: F401
@@ -25,6 +27,7 @@ import app.models.payment  # noqa: F401
 import app.models.policy  # noqa: F401
 import app.models.policy_member  # noqa: F401
 import app.models.request_assignment  # noqa: F401
+import app.models.service_quote  # noqa: F401
 import app.models.service_request  # noqa: F401
 import app.models.service_type  # noqa: F401
 import app.models.subscription_plan  # noqa: F401

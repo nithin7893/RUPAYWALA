@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     TIMESTAMP,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -72,6 +73,12 @@ class ServiceRequest(Base):
     request_type = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
 
+    # Fixed-quote linkage. NULL for legacy requests created without a quote.
+    # The unique constraint means one quotation can never be attached to two
+    # service requests, which complements the reverse unique link on
+    # service_quotes.service_request_id.
+    quote_ref = Column(String(64), nullable=True)
+
     # ---------------- customer location ----------------
     customer_latitude = Column(Numeric(10, 7), nullable=True)
     customer_longitude = Column(Numeric(10, 7), nullable=True)
@@ -122,6 +129,12 @@ class ServiceRequest(Base):
     # ---------------- assignment / completion ----------------
     completion_notes = Column(Text, nullable=True)
     proof_image_url = Column(String, nullable=True)
+    proof_document_id = Column(
+        String(36),
+        ForeignKey("document_records.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     cancellation_reason = Column(String(255), nullable=True)
     cancelled_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -139,6 +152,7 @@ class ServiceRequest(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
+        UniqueConstraint("quote_ref", name="uq_service_requests_quote_ref"),
         Index("idx_service_requests_user_status", "user_id", "status"),
         Index("idx_service_requests_status_branch", "status", "branch_id"),
     )

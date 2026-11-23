@@ -184,20 +184,23 @@ class OTPService:
         return record, code, delivered
 
     @staticmethod
-    def verify(db: Session, phone_number: str, code: str) -> OTPVerification:
+    def verify(
+        db: Session,
+        phone_number: str,
+        code: str,
+        purpose: OTPPurpose | None = None,
+    ) -> OTPVerification:
         phone = normalise_phone(phone_number)
         if not is_valid_phone(phone):
             raise HTTPException(status_code=400, detail="Enter a valid 10-digit mobile number")
 
-        record = (
-            db.query(OTPVerification)
-            .filter(
-                OTPVerification.phone_number == phone,
-                OTPVerification.is_used.is_(False),
-            )
-            .order_by(OTPVerification.id.desc())
-            .first()
+        query = db.query(OTPVerification).filter(
+            OTPVerification.phone_number == phone,
+            OTPVerification.is_used.is_(False),
         )
+        if purpose is not None:
+            query = query.filter(OTPVerification.purpose == purpose)
+        record = query.order_by(OTPVerification.id.desc()).first()
         if record is None:
             raise HTTPException(status_code=400, detail="Request a new verification code")
 
@@ -234,6 +237,13 @@ class OTPService:
 
     @staticmethod
     def verify_email(db: Session, email: str, code: str, purpose: OTPPurpose | None = None) -> OTPVerification:
+        """Verify and atomically consume the newest unused email OTP.
+
+        The candidate row is locked while the code is checked, and consumption
+        is a conditional update, so concurrent requests cannot both succeed
+        with the same code. Email verification now has the same single-use
+        semantics as phone verification (``verify``).
+        """
         email_clean = email.strip().lower()
         if not EMAIL_RE.match(email_clean):
             raise HTTPException(status_code=400, detail="Enter a valid email address")
@@ -244,8 +254,13 @@ class OTPService:
         )
         if purpose is not None:
             query = query.filter(OTPVerification.purpose == purpose)
-        record = query.order_by(OTPVerification.id.desc()).first()
+        # SELECT ... FOR UPDATE keeps code verification and consumption in one
+        # atomic critical section across workers.
+        record = query.order_by(OTPVerification.id.desc()).with_for_update().first()
         if record is None:
+            raise HTTPException(status_code=400, detail="Request a new verification code")
+        if record.is_used:
+            # Defensive: another transaction consumed the row after the read.
             raise HTTPException(status_code=400, detail="Request a new verification code")
 
         if record.is_expired():
@@ -273,7 +288,22 @@ class OTPService:
                 ),
             )
 
-        record.verified = True
+        # Conditional update is the commit point: only the request that flips
+        # is_used from false to true owns the code.
+        consumed = (
+            db.query(OTPVerification)
+            .filter(
+                OTPVerification.id == record.id,
+                OTPVerification.is_used.is_(False),
+            )
+            .update(
+                {OTPVerification.verified: True, OTPVerification.is_used: True},
+                synchronize_session=False,
+            )
+        )
+        if consumed != 1:
+            db.rollback()
+            raise HTTPException(status_code=400, detail="Request a new verification code")
         db.commit()
         db.refresh(record)
         return record

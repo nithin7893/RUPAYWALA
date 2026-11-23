@@ -313,3 +313,55 @@ def test_duplicate_family_member_is_rejected(client, db):
         },
     )
     assert duplicate.status_code == 409
+
+
+def test_seed_subscription_plans_concurrent_startup(db):
+    import threading
+
+    from sqlalchemy.orm import sessionmaker
+
+    # Derive worker sessions from the fixture's bind so they always use the
+    # PostgreSQL test database, even if another module reloaded app.database.
+    worker_bind = db.get_bind()
+    assert worker_bind.dialect.name == "postgresql"
+    assert worker_bind.url.database == "rupaywala_test"
+    WorkerSession = sessionmaker(
+        bind=worker_bind, autocommit=False, autoflush=False, expire_on_commit=False
+    )
+
+    seed_subscription_plans(db)
+    baseline = {
+        p.code: p.id
+        for p in db.query(SubscriptionPlan).filter(SubscriptionPlan.is_active.is_(True)).all()
+    }
+    db.commit()
+
+    barrier = threading.Barrier(5)
+    errors = []
+    lock = threading.Lock()
+
+    def worker():
+        session = WorkerSession()
+        try:
+            barrier.wait(timeout=20)
+            seed_subscription_plans(session)
+        except Exception as exc:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            with lock:
+                errors.append(str(exc))
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert errors == []
+    plans = db.query(SubscriptionPlan).filter(SubscriptionPlan.is_active.is_(True)).all()
+    assert len(plans) == 7
+    assert {p.code: p.id for p in plans} == baseline

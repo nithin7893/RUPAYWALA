@@ -55,6 +55,9 @@ class User(Base):
 
     is_verified = Column(Boolean, default=False, nullable=False)
 
+    # Incremented on password change/reset/logout-all to invalidate old JWTs.
+    token_version = Column(Integer, default=0, nullable=False)
+
     account_status = Column(ACCOUNT_STATUS, default=AccountStatus.active, nullable=False)
 
     auth_provider = Column(AUTH_PROVIDER, default=AuthProvider.phone_otp, nullable=False)

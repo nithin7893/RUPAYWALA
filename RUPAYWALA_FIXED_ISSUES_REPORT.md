@@ -1,0 +1,27 @@
+# RUPAYWALA FIXED ISSUES REPORT
+
+**Date:** 2026-11-21  
+**Stage:** 1 - Client Demonstration Readiness and Application Stabilization
+
+## Fixed in This Pass
+
+| ID | Severity | Issue | Affected Modules | Fix Applied | Regression / Risk Notes | Verification |
+|---|---|---|---|---|---|---|
+| FIX-001 | P1/Security | Forgot-password reset verified OTP manually and bypassed attempt limit, used-state checks, and OTPService verify flow. | `app/routes/auth_routes.py`, `app/services/otp_service.py` | Added optional `purpose` filter to `OTPService.verify`; reset endpoint now calls `OTPService.verify(..., purpose=OTPPurpose.reset_password)`, validates password, increments token version, and commits. | OTP is consumed on successful verify before password-strength failure; user must request new OTP if password invalid. This is secure but slightly stricter UX. | Static code review + `compileall` PASS. No runtime test executed. |
+| FIX-002 | P1/Security | Google access-token verification accepted `aud is None`, allowing weak audience binding. | `app/services/google_auth_service.py` | Require `aud == GOOGLE_CLIENT_ID`; parse `email_verified` string/bool strictly; reject missing `sub`/invalid `email`. | Access-token path now rejects tokens without matching audience. Legitimate misconfigured clients will fail closed. | Static code review + `compileall` PASS. No live Google OAuth test. |
+| FIX-003 | P1/Security | JWTs were stateless with no revocation on logout/password change/reset; `jti` existed but no invalidation. | `app/models/user.py`, `app/utils/dependencies.py`, `app/routes/auth_routes.py`, `app/utils/jwt_handler.py` consumer path, `rupaywala_app/lib/core/api/repositories/auth_repository.dart`, `rupaywala_app/lib/core/state/session_controller.dart`, `alembic/versions/0007_user_token_version.py` | Added `users.token_version`, JWT `tv` claim, dependency enforcement, `/auth/logout` endpoint, and token version increment on password change/reset/logout. Flutter logout calls backend then clears local token. | Existing tokens without `tv` are treated as version 0; after password change/reset/logout all sessions for user are invalidated. Migration required for existing DBs. | Static code review + `compileall` PASS. No DB migration/runtime test executed. |
+| FIX-004 | P1/Demo workflow | Flutter service request flow did not use backend fixed-quote APIs, bypassing Stage 5 quote-backed price integrity in UI. | `rupaywala_app/lib/core/models/service_models.dart`, `rupaywala_app/lib/core/api/repositories/service_repository.dart`, `rupaywala_app/lib/features/service/service_request_screen.dart` | Added `FixedQuote` model, `createFixedQuote` repo method, `quoteId` in create request; service request screen now creates fixed quote on branch selection and submits request with `quote_id`. | Requires backend quote endpoint availability and valid env/DB. Quote expiry will surface as backend error; UI blocks submit until quote loaded. Legacy backend path still exists. | Static code review only; Flutter CLI unavailable. |
+| FIX-005 | P2/Security | Upload validation allowed `.webp` by extension without magic-byte validation. | `app/utils/upload_service.py` | Added RIFF/WEBP signature check for `.webp` files. | Invalid/corrupt webp files now rejected. | Static code review + `compileall` PASS. |
+| FIX-006 | P2/Demo usability | Completion proof files had no app static mount; proof URLs may be inaccessible in demo. | `app/main.py` | Mounted `UPLOAD_DIR` at `/uploads` using FastAPI `StaticFiles`. | Exposes files under upload directory by path; acceptable for demo if upload dir contains only intended proof files. Production should use authenticated/object storage strategy. | Static code review + `compileall` PASS. No runtime check. |
+| FIX-007 | P2/Reliability | Flutter `Api` could create separate `TokenStore` instances for client and session, causing token-state desync. | `rupaywala_app/lib/core/api/api.dart` | Refactored `Api` to factory that shares one `TokenStore` with `ApiClient`. | Low regression risk; constructor behavior preserved. | Static code review only. |
+
+## Not Fixed (Requires Separate Decision / Verification)
+
+| ID | Severity | Issue | Reason Not Fully Fixed | Safe Mitigation |
+|---|---|---|---|---|
+| OPEN-001 | P1 | No runtime end-to-end demo verification. | Flutter CLI unavailable; pytest blocked by DB-modifying conftest; no isolated demo DB confirmed. | Run commands in isolated disposable environment; follow test results report. |
+| OPEN-002 | P1 | Demo accounts/data/environment not confirmed. | No authorized DB seeding/credentials; cannot create demo users in DB without authorization. | Prepare sanitized demo DB and accounts outside prod; document credentials securely. |
+| OPEN-003 | P2 | JWT revocation is token-version based (all-user sessions invalidated) rather than per-session blacklist/refresh-token model. | Full refresh/session architecture is larger than Stage 1 scope. | Password change/reset/logout invalidate old tokens; keep access token lifetime reasonable in env. |
+| OPEN-004 | P2 | CORS default allows `*` in config if env not set. | Changing default may break local/dev; deployment env-specific. | Set `CORS_ALLOWED_ORIGINS` explicitly in demo/prod env. |
+| OPEN-005 | P2 | Rate limiting is in-process only. | Redis/shared limiter is production hardening. | Acceptable for single-instance demo; document limitation. |
+| OPEN-006 | P3 | Push notifications, OCR, cloud storage, CI/CD, Docker, web app. | Explicitly out of Stage 1 scope. | Keep in Roadmap B. |

@@ -49,6 +49,15 @@ def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This account has been suspended. Please contact support.",
         )
+
+    token_version = payload.get("tv", 0)
+    try:
+        token_version = int(token_version)
+    except (TypeError, ValueError):
+        raise _UNAUTHENTICATED
+    current_version = int(getattr(user, "token_version", 0) or 0)
+    if token_version != current_version:
+        raise _UNAUTHENTICATED
     return user
 
 

@@ -38,6 +38,8 @@ from app.schemas.service_request_schema import (
     PlaceDetailsRequest,
     PlaceDetailsResponse,
     PlaceSuggestionResponse,
+    QuoteCreate,
+    QuoteResponse,
     ServiceRequestCreate,
     ServiceRequestResponse,
     ServiceTypeResponse,
@@ -45,6 +47,7 @@ from app.schemas.service_request_schema import (
 from app.schemas.branch_schema import BranchResponse, BranchWithDistance
 from app.services import map_service as maps
 from app.services.pricing_service import PricingConfig, build_quote, get_pricing_config
+from app.services.quote_service import QuoteService
 from app.services.request_status_service import RequestStatusService
 from app.services.subscription_service import SubscriptionService
 from app.services.visit_service import VisitService
@@ -220,6 +223,7 @@ def _build_response(db: Session, request: ServiceRequest) -> ServiceRequestRespo
         cancellation_reason=request.cancellation_reason,
         completion_notes=request.completion_notes,
         proof_image_url=request.proof_image_url,
+        proof_document_id=request.proof_document_id,
         assignment=member_summary,
         payment=_payment_summary(db, request.id),
         assigned_at=request.assigned_at,
@@ -229,13 +233,76 @@ def _build_response(db: Session, request: ServiceRequest) -> ServiceRequestRespo
     )
 
 
+def _quote_summary(db: Session, quote) -> QuoteResponse:
+    """Render the persisted quote row. No value is recalculated here."""
+    service = db.get(ServiceType, quote.service_type_id) if quote.service_type_id else None
+    branch = db.get(Branch, quote.branch_id) if quote.branch_id else None
+    policy = db.get(Policy, quote.policy_id) if quote.policy_id else None
+    return QuoteResponse(
+        quote_id=quote.quote_ref,
+        status=quote.status.value,
+        service_type_id=quote.service_type_id,
+        service_type_name=service.name if service else None,
+        request_type=quote.request_type,
+        branch_id=quote.branch_id,
+        branch_name=branch.name if branch else None,
+        branch_address=branch.address if branch else None,
+        policy_id=quote.policy_id,
+        policy_label=_policy_label(policy),
+        family_member_id=quote.family_member_id,
+        distance_km=float(quote.distance_km) if quote.distance_km is not None else None,
+        duration_minutes=(
+            float(quote.duration_minutes) if quote.duration_minutes is not None else None
+        ),
+        threshold_km=(
+            float(quote.threshold_km_used) if quote.threshold_km_used is not None else None
+        ),
+        charge_per_km=(
+            float(quote.charge_per_km_used) if quote.charge_per_km_used is not None else None
+        ),
+        round_trip_factor=(
+            float(quote.round_trip_factor_used)
+            if quote.round_trip_factor_used is not None
+            else None
+        ),
+        excess_distance_km=(
+            float(quote.excess_distance_km)
+            if quote.excess_distance_km is not None
+            else None
+        ),
+        entitlement_included_distance_km=(
+            float(quote.entitlement_included_distance_km)
+            if quote.entitlement_included_distance_km is not None
+            else None
+        ),
+        base_amount=float(quote.base_amount or 0),
+        extra_charge=float(quote.extra_charge or 0),
+        tax_percent=(
+            float(quote.tax_percent_used) if quote.tax_percent_used is not None else None
+        ),
+        tax_amount=float(quote.tax_amount or 0),
+        total_amount=float(quote.total_amount or 0),
+        currency=quote.currency or "INR",
+        within_threshold=bool(quote.within_threshold),
+        requires_payment=bool(quote.requires_payment),
+        created_at=quote.created_at,
+        expires_at=quote.expires_at,
+        consumed_at=quote.consumed_at,
+        service_request_id=quote.service_request_id,
+    )
+
+
 # ======================================================================
 # 1. Location services
 # ======================================================================
 @router.post("/geocode", response_model=list[PlaceSuggestionResponse])
 def geocode(payload: LocationSearchRequest, _: User = Depends(customer_required)):
-    """Address autocomplete backed by Mappls."""
-    results = _maps_guard(lambda svc: svc.autosuggest(payload.query, limit=8))
+    """Address autocomplete backed by Google Places API (New)."""
+    results = _maps_guard(
+        lambda svc: svc.autosuggest(
+            payload.query, limit=8, session_token=payload.session_token
+        )
+    )
     return [
         PlaceSuggestionResponse(
             place_id=r.place_id,
@@ -250,7 +317,11 @@ def geocode(payload: LocationSearchRequest, _: User = Depends(customer_required)
 
 @router.post("/place-details", response_model=PlaceDetailsResponse)
 def place_details(payload: PlaceDetailsRequest, _: User = Depends(customer_required)):
-    details = _maps_guard(lambda svc: svc.place_details(payload.place_id))
+    details = _maps_guard(
+        lambda svc: svc.place_details(
+            payload.place_id, session_token=payload.session_token
+        )
+    )
     return PlaceDetailsResponse(
         place_id=details.place_id,
         name=details.name,
@@ -260,6 +331,7 @@ def place_details(payload: PlaceDetailsRequest, _: User = Depends(customer_requi
         city=details.city,
         state=details.state,
         pincode=details.pincode,
+        country=details.country,
     )
 
 
@@ -449,7 +521,45 @@ def _quote_response(
 
 
 # ======================================================================
-# 3. Create / read / cancel requests
+# 3. Fixed quotations
+# ======================================================================
+@router.post(
+    "/quote",
+    response_model=QuoteResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_fixed_quote(
+    payload: QuoteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(customer_required),
+):
+    """Create a persisted, expiring, single-use fixed-price quotation."""
+    quote = QuoteService.create_quote(db, user=current_user, payload=payload)
+    return _quote_summary(db, quote)
+
+
+@router.get("/quote/{quote_id}", response_model=QuoteResponse)
+def get_fixed_quote(
+    quote_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(customer_required),
+):
+    quote = QuoteService.get_quote(db, user=current_user, quote_ref=quote_id)
+    return _quote_summary(db, quote)
+
+
+@router.post("/quote/{quote_id}/cancel", response_model=QuoteResponse)
+def cancel_fixed_quote(
+    quote_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(customer_required),
+):
+    quote = QuoteService.cancel_quote(db, user=current_user, quote_ref=quote_id)
+    return _quote_summary(db, quote)
+
+
+# ======================================================================
+# 4. Create / read / cancel requests
 # ======================================================================
 @router.post(
     "/request",
@@ -461,6 +571,15 @@ def create_request(
     db: Session = Depends(get_db),
     current_user: User = Depends(customer_required),
 ):
+    # Fixed-price path: the quote snapshot is authoritative. No distance or
+    # pricing calculation happens again, so a later config/rate/cache change
+    # cannot move the amount the customer was promised.
+    if payload.quote_id:
+        request = QuoteService.consume_for_request(db, user=current_user, payload=payload)
+        db.commit()
+        db.refresh(request)
+        return _build_response(db, request)
+
     service_type = None
     if payload.service_type_id is not None:
         service_type = db.get(ServiceType, payload.service_type_id)

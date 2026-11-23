@@ -81,6 +81,6 @@ def save_upload(file: UploadFile, subdir: str = "proof") -> str:
 def _looks_valid(content: bytes, ext: str) -> bool:
     if ext == ".pdf":
         return content.startswith(_PDF_SIGNATURE)
-    return any(content.startswith(sig) for sig in _SIGNATURES) or ext in (
-        ".webp",
-    )
+    if ext == ".webp":
+        return len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+    return any(content.startswith(sig) for sig in _SIGNATURES)

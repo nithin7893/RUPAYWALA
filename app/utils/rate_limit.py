@@ -8,6 +8,10 @@ Two layers are used:
 
 The store is in-process, which is correct for a single-instance deployment.
 Swap the ``_buckets`` dict for Redis when running more than one worker.
+
+Client identity comes from :func:`app.utils.proxy.client_ip`: forwarding headers
+are honoured only for explicitly configured trusted proxies. Limits and scopes
+are unchanged by that hardening.
 """
 
 import threading
@@ -15,6 +19,8 @@ import time
 from collections import defaultdict, deque
 
 from fastapi import HTTPException, Request, status
+
+from app.utils.proxy import client_ip
 
 _lock = threading.Lock()
 _buckets: dict[str, deque] = defaultdict(deque)
@@ -40,11 +46,8 @@ def hit(key: str, limit: int, window_seconds: int) -> tuple[bool, int]:
 
 
 def _client_key(request: Request, scope: str) -> str:
-    client = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client = forwarded.split(",")[0].strip()
-    return f"{scope}:{client}"
+    """Bounded, validated identity; never taken from an untrusted header."""
+    return f"{scope}:{client_ip(request)}"
 
 
 def rate_limit(limit: int, window_seconds: int = 60, scope: str | None = None):

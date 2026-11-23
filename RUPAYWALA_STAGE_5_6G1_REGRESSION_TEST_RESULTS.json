@@ -1,0 +1,99 @@
+{
+  "passed": 10,
+  "total": 10,
+  "all_passed": true,
+  "results": [
+    {
+      "test": "1_first_payment_creation",
+      "ok": true,
+      "detail": {
+        "txn": "8481e4af-4576-462c-84aa-a1849ea5281a",
+        "status": "pending",
+        "rows": 1
+      }
+    },
+    {
+      "test": "2_sequential_duplicate",
+      "ok": true,
+      "detail": {
+        "txn1": "c95d1d79-081b-4dd0-8a12-5b09bd94aab7",
+        "txn2": "c95d1d79-081b-4dd0-8a12-5b09bd94aab7",
+        "rows": 1
+      }
+    },
+    {
+      "test": "3_concurrent_duplicate",
+      "ok": true,
+      "detail": {
+        "out": [
+          [
+            "ok",
+            "185e87db-bac7-473a-931b-af79dd1e31f6"
+          ],
+          [
+            "ok",
+            "185e87db-bac7-473a-931b-af79dd1e31f6"
+          ]
+        ],
+        "rows": 1
+      }
+    },
+    {
+      "test": "4_same_key_changed_payload",
+      "ok": true,
+      "detail": {
+        "first": "933749e4-fee0-4661-aabf-3ad325793ce4",
+        "error": 409
+      }
+    },
+    {
+      "test": "5_different_user_same_key",
+      "ok": true,
+      "detail": {
+        "a": "ca338420-856b-4358-b2f1-a3f080116af6",
+        "b": "882bf1de-2f53-49d9-b920-32fd5b285c14"
+      }
+    },
+    {
+      "test": "6_retry_after_pending",
+      "ok": true,
+      "detail": {
+        "txn": "5541133f-bdaf-4f30-92de-b4ef3cec5681",
+        "rows": 1
+      }
+    },
+    {
+      "test": "7_retry_after_success",
+      "ok": true,
+      "detail": {
+        "verified": "800d334e-0d2a-4fda-ab2e-ee6fbaaaf4c3",
+        "retry": "800d334e-0d2a-4fda-ab2e-ee6fbaaaf4c3",
+        "rows": 1
+      }
+    },
+    {
+      "test": "8_retry_after_failure",
+      "ok": true,
+      "detail": {
+        "rejected": "9dd81e0e-9424-4d10-aa59-6db4c3f953cf",
+        "retry": "9dd81e0e-9424-4d10-aa59-6db4c3f953cf"
+      }
+    },
+    {
+      "test": "9_duplicate_submit",
+      "ok": true,
+      "detail": {
+        "attempts": 1,
+        "status": "pending_verification"
+      }
+    },
+    {
+      "test": "10_duplicate_admin_verify",
+      "ok": true,
+      "detail": {
+        "status1": "success",
+        "status2": "success"
+      }
+    }
+  ]
+}

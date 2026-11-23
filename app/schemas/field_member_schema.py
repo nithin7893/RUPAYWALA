@@ -140,6 +140,7 @@ class FieldMemberJobResponse(BaseModel):
     distance_km: Optional[float] = None
     completion_notes: Optional[str] = None
     proof_image_url: Optional[str] = None
+    proof_document_id: Optional[str] = None
     assigned_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

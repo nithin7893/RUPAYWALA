@@ -120,16 +120,25 @@ class GoogleAuthService:
             raise HTTPException(status_code=401, detail="Google sign-in could not be verified")
 
         data = response.json()
-        if data.get("aud") not in (GOOGLE_CLIENT_ID, None):
+        if data.get("aud") != GOOGLE_CLIENT_ID:
             raise HTTPException(status_code=401, detail="Google sign-in could not be verified")
-        if not data.get("email_verified"):
+
+        email_verified = data.get("email_verified")
+        if isinstance(email_verified, str):
+            email_verified = email_verified.lower() == "true"
+        if not bool(email_verified):
             raise HTTPException(
                 status_code=403, detail="Your Google account email is not verified"
             )
 
+        sub = str(data.get("sub") or "").strip()
+        email = str(data.get("email") or "").strip().lower()
+        if not sub or "@" not in email:
+            raise HTTPException(status_code=401, detail="Google sign-in could not be verified")
+
         return GoogleIdentity(
-            sub=str(data.get("sub")),
-            email=str(data.get("email", "")).lower(),
+            sub=sub,
+            email=email,
             email_verified=True,
             name=data.get("name"),
             picture=data.get("picture"),

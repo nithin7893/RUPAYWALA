@@ -314,3 +314,67 @@ class TestAuthenticationEndpoints:
         )
         assert response.status_code == 200
         assert "123456" not in response.text
+
+
+class TestTokenVersionInvalidation:
+    """The jwt `tv` claim must track users.token_version (migration 0007)."""
+
+    def test_login_token_carries_current_token_version(self, client, db):
+        user = f.make_user(db)
+        response = client.post(
+            "/auth/login",
+            json={"identifier": user.phone_number, "password": f.DEFAULT_PASSWORD},
+        )
+        assert response.status_code == 200, response.text
+
+        claims = jwt.decode(
+            response.json()["access_token"], JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
+        assert claims["user_id"] == user.id
+        assert claims["tv"] == user.token_version == 0
+
+        me = client.get(
+            "/auth/me", headers={"Authorization": f"Bearer {response.json()['access_token']}"}
+        )
+        assert me.status_code == 200
+
+    def test_logout_increments_version_and_invalidates_existing_token(self, client, db):
+        user = f.make_user(db)
+        login = client.post(
+            "/auth/login",
+            json={"identifier": user.phone_number, "password": f.DEFAULT_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
+        token = login.json()["access_token"]
+
+        logout = client.post("/auth/logout", headers={"Authorization": f"Bearer {token}"})
+        assert logout.status_code == 200
+
+        db.refresh(user)
+        assert user.token_version == 1
+
+        stale = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert stale.status_code == 401
+
+        relogin = client.post(
+            "/auth/login",
+            json={"identifier": user.phone_number, "password": f.DEFAULT_PASSWORD},
+        )
+        assert relogin.status_code == 200
+        claims = jwt.decode(
+            relogin.json()["access_token"], JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
+        assert claims["tv"] == user.token_version == 1
+        assert client.get(
+            "/auth/me", headers={"Authorization": f"Bearer {relogin.json()['access_token']}"}
+        ).status_code == 200
+
+    def test_token_with_stale_version_is_rejected(self, client, db):
+        user = f.make_user(db)
+        stale_token = create_access_token(
+            {"user_id": user.id, "tv": user.token_version + 1}
+        )
+        response = client.get(
+            "/auth/me", headers={"Authorization": f"Bearer {stale_token}"}
+        )
+        assert response.status_code == 401

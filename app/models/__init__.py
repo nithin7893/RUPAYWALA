@@ -8,6 +8,8 @@ kept explicit here instead of relying on every caller to remember the list.
 from app.models.branch import Branch
 from app.models.customer_profile import CustomerProfile
 from app.models.distance_rate_config import DistanceRateConfig
+from app.models.document_audit_log import DocumentAuditLog
+from app.models.document_record import DocumentRecord, DocumentScanStatus, DocumentStorageProvider
 from app.models.family_member import FamilyMember
 from app.models.field_member import FieldMember, FieldMemberApprovalStatus
 from app.models.notification import Notification, NotificationCategory
@@ -16,6 +18,7 @@ from app.models.payment import Payment, PaymentStatus, PaymentType
 from app.models.policy import Policy
 from app.models.policy_member import PolicyMember
 from app.models.request_assignment import AssignmentStatus, RequestAssignment
+from app.models.service_quote import QuoteStatus, ServiceQuote
 from app.models.service_request import RequestStatus, ServiceRequest
 from app.models.service_type import ServiceType
 from app.models.subscription_plan import SubscriptionPlan
@@ -31,6 +34,10 @@ __all__ = [
     "Branch",
     "CustomerProfile",
     "DistanceRateConfig",
+    "DocumentAuditLog",
+    "DocumentRecord",
+    "DocumentScanStatus",
+    "DocumentStorageProvider",
     "FamilyMember",
     "FieldMember",
     "FieldMemberApprovalStatus",
@@ -43,8 +50,10 @@ __all__ = [
     "PaymentType",
     "Policy",
     "PolicyMember",
+    "QuoteStatus",
     "RequestAssignment",
     "RequestStatus",
+    "ServiceQuote",
     "ServiceRequest",
     "ServiceType",
     "SubscriptionPlan",

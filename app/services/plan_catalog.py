@@ -1,6 +1,6 @@
 """Canonical, idempotent subscription catalog seeding."""
 
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from app.models.subscription_plan import SubscriptionPlan
@@ -168,21 +168,71 @@ _PLANS = (
 )
 
 
+def _ensure_subscription_plans_sequence(db: Session) -> None:
+    """Advance subscription_plans.id sequence when behind max(id).
+
+    Uses nextval (USAGE) only - no setval/UPDATE privilege required. Never moves
+    the sequence backward. A boundary case where last_value == max(id) may advance
+    by one extra value when the sequence was already consistent; this is harmless
+    and preserves existing IDs/data.
+    """
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+
+    seq_name = db.execute(
+        text("SELECT pg_get_serial_sequence('public.subscription_plans', 'id')")
+    ).scalar()
+    if not seq_name:
+        return
+
+    max_id = db.query(func.max(SubscriptionPlan.id)).scalar()
+    if max_id is None:
+        return
+    max_id = int(max_id)
+
+    row = db.execute(
+        text(
+            "SELECT last_value "
+            "FROM pg_sequences "
+            "WHERE schemaname = split_part(:seq, '.', 1) "
+            "AND sequencename = split_part(:seq, '.', 2)"
+        ),
+        {"seq": str(seq_name)},
+    ).first()
+    last_value = int(row[0]) if row and row[0] is not None else None
+
+    # Already safely ahead.
+    if last_value is not None and last_value > max_id:
+        return
+
+    # Behind, unknown, or exact boundary: advance until nextval >= max_id.
+    while True:
+        current = int(
+            db.execute(
+                text("SELECT nextval(CAST(:seq AS regclass))"),
+                {"seq": str(seq_name)},
+            ).scalar()
+        )
+        if current >= max_id:
+            return
+
+
+_SEED_ADVISORY_LOCK_KEY = "rupaywala:subscription_plan_seed"
+
+
 def seed_subscription_plans(db: Session) -> None:
     """Create/update only canonical rows and archive plans outside the catalog."""
-    if db.get_bind().dialect.name == "postgresql":
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        # Serialize concurrent startup workers. Transaction-scoped lock releases
+        # automatically on commit/rollback and cannot leak across pooled connections.
         db.execute(
-            text(
-                """
-                SELECT setval(
-                    pg_get_serial_sequence('subscription_plans', 'id'),
-                    COALESCE(MAX(id), 1),
-                    MAX(id) IS NOT NULL
-                )
-                FROM subscription_plans
-                """
-            )
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": _SEED_ADVISORY_LOCK_KEY},
         )
+
+    _ensure_subscription_plans_sequence(db)
 
     catalog_codes = {plan["code"] for plan in _PLANS}
     for values in _PLANS:

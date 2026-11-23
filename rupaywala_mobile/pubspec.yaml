@@ -1,0 +1,79 @@
+name: rupaywala_app
+description: A Flutter application for Rupaywala services.
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # HTTP requests (FastAPI communication)
+  http: ^1.2.0
+
+  # State management
+  provider: ^6.1.2
+
+  # Secure storage for JWT token
+  flutter_secure_storage: ^9.0.0
+
+  # Navigation system
+  go_router: ^13.2.0
+
+  # QR code display
+  qr_flutter: ^4.1.0
+
+  # Open UPI apps
+  url_launcher: ^6.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+
+flutter:
+
+  uses-material-design: true
+
+  # Inter is bundled rather than fetched at runtime so the first frame and the
+  # offline experience use the same typeface as the rest of the product.
+  # Files are the static TTFs from Inter 4.1 (SIL OFL 1.1); see
+  # assets/fonts/Inter-LICENSE.txt.
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Inter-Bold.ttf
+          weight: 700
+
+    # Flutter Web's CanvasKit renderer fetches Roboto from fonts.gstatic.com at
+    # startup unless the font manifest already contains a family named Roboto.
+    # The product uses Inter everywhere, so pointing that fallback family at the
+    # bundled Inter files keeps web startup free of external font downloads.
+    - family: Roboto
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Inter-Bold.ttf
+          weight: 700
+
+  # Assets for the application
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/

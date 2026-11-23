@@ -1,9 +1,39 @@
+# Environment and secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+
+# Python / tooling
 venv/
 .venv/
-.idea/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-qr_output.png
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 nul
+
+# Local artifacts / sensitive data
+uploads/
+database_backups/
+*.dump
+*.sql.gz
+*.bak
+*.backup
+*.sqlite
+*.db
+*.log
+qr_output.png

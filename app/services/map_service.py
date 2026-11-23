@@ -1,37 +1,26 @@
 """
-Map provider abstraction.
+Map provider abstraction and compatibility facade.
 
-Rupaywala resolves customer locations, branch coordinates and road distances
-through Mappls:
+Google Maps is the only active distance/location provider. Provider
+implementations conform to the shared :class:`MapService` interface so routes
+and services never depend on vendor-specific payloads.
 
-    autosuggest      -> location search suggestions
-    place details    -> address + lat/lng for the chosen suggestion
-    distance matrix  -> ROAD distance (never straight-line) to the branch
-
-Nothing above this module knows which provider is in use. ``get_map_service()``
-returns the configured implementation; ``MAPPLS_API_KEY`` (plus client id and
-secret) is read from the environment, never hard-coded.
-
-When no provider is configured the service raises ``MapProviderNotConfigured``,
-which routes translate into a friendly 503 rather than a stack trace. That keeps
-the whole feature testable and lets the app degrade gracefully.
+Legacy Mappls/Ola implementations are retained below for compatibility but are
+never selected or invoked as fallbacks.
 """
 
-import asyncio
 import base64
 import hashlib
 import logging
-import threading
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Protocol
 
 import httpx
 from jose import jwt as jose_jwt
 
 from app.config import (
     DEBUG,
+    GOOGLE_MAPS_API_KEY,
     MAP_CACHE_TTL_SECONDS,
     MAP_GEOCODE_CACHE_TTL_SECONDS,
     MAP_PROVIDER,
@@ -45,132 +34,59 @@ from app.config import (
     OLA_MAPS_BASE_URL,
     OLA_MAPS_TIMEOUT,
 )
+from app.services.map_providers.base import (
+    BillingOrQuotaError,
+    DistanceResult,
+    GoogleNotConfiguredError,
+    InvalidCoordinateError,
+    InvalidCredentialsError,
+    MalformedProviderResponseError,
+    MapProviderError,
+    MapProviderNotConfigured,
+    MapProviderUnavailable,
+    MapService,
+    NoRouteFoundError,
+    PlaceDetails,
+    PlaceSuggestion,
+    ProviderRateLimitedError,
+    ProviderTimeoutError,
+    TTLCache,
+    run_async,
+    validate_coordinates,
+)
+from app.services.map_providers.google_maps import GoogleMapsService
 
 logger = logging.getLogger(__name__)
 
+# Backward-compatible alias for legacy in-module cache usage.
+_TTLCache = TTLCache
 
-# ======================================================================
-# Errors
-# ======================================================================
-class MapProviderNotConfigured(Exception):
-    """No map provider credentials are available."""
-
-
-class MapProviderError(Exception):
-    """The provider responded with an error."""
-
-
-class MapProviderUnavailable(Exception):
-    """The provider could not be reached."""
-
-
-# ======================================================================
-# Value objects
-# ======================================================================
-@dataclass(frozen=True)
-class DistanceResult:
-    distance_km: float
-    duration_minutes: float
-
-
-@dataclass(frozen=True)
-class PlaceSuggestion:
-    place_id: str
-    name: str
-    address: str
-    latitude: float
-    longitude: float
-
-
-@dataclass(frozen=True)
-class PlaceDetails:
-    place_id: str
-    name: str
-    address: str
-    latitude: float
-    longitude: float
-    city: str | None = None
-    state: str | None = None
-    pincode: str | None = None
-
-
-class MapService(Protocol):
-    async def autosuggest(self, query: str, limit: int = 8) -> list[PlaceSuggestion]: ...
-    async def place_details(self, place_id: str) -> PlaceDetails: ...
-    async def geocode_address(self, address: str) -> PlaceDetails: ...
-    async def calculate_distance(
-        self, origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: float
-    ) -> DistanceResult: ...
-    async def distances_from_origin(
-        self, origins: list[tuple[float, float]], dest_lat: float, dest_lng: float
-    ) -> list[DistanceResult]: ...
-
-
-# ======================================================================
-# Shared infrastructure
-# ======================================================================
-def _start_background_loop() -> asyncio.AbstractEventLoop:
-    loop = asyncio.new_event_loop()
-    threading.Thread(target=loop.run_forever, daemon=True, name="map-loop").start()
-    logger.info("Background event loop started for map provider")
-    return loop
-
-
-_loop: asyncio.AbstractEventLoop | None = None
-_loop_lock = threading.Lock()
-
-
-def _background_loop() -> asyncio.AbstractEventLoop:
-    global _loop
-    with _loop_lock:
-        if _loop is None or _loop.is_closed():
-            _loop = _start_background_loop()
-        return _loop
-
-
-def run_async(coro):
-    """Run a coroutine from synchronous route code (used by admin routes)."""
-    return asyncio.run_coroutine_threadsafe(coro, _background_loop()).result(
-        timeout=60
-    )
-
-
-class _TTLCache:
-    """Tiny thread-safe TTL cache to avoid hammering the paid map APIs."""
-
-    def __init__(self, ttl: int):
-        self.ttl = ttl
-        self._data: dict[str, object] = {}
-        self._stamps: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def get(self, key: str):
-        with self._lock:
-            stamp = self._stamps.get(key)
-            if stamp is not None and time.time() - stamp < self.ttl:
-                return self._data.get(key)
-            self._data.pop(key, None)
-            self._stamps.pop(key, None)
-        return None
-
-    def set(self, key: str, value) -> None:
-        with self._lock:
-            self._data[key] = value
-            self._stamps[key] = time.time()
-
-    def clear(self) -> None:
-        with self._lock:
-            self._data.clear()
-            self._stamps.clear()
-
-
-def validate_coordinates(lat: float, lng: float, label: str = "coordinate") -> None:
-    if lat is None or lng is None:
-        raise ValueError(f"Missing {label}")
-    if not (-90 <= float(lat) <= 90):
-        raise ValueError(f"Invalid {label} latitude: {lat}")
-    if not (-180 <= float(lng) <= 180):
-        raise ValueError(f"Invalid {label} longitude: {lng}")
+__all__ = [
+    "BillingOrQuotaError",
+    "DistanceResult",
+    "GoogleMapsService",
+    "GoogleNotConfiguredError",
+    "InvalidCoordinateError",
+    "InvalidCredentialsError",
+    "MalformedProviderResponseError",
+    "MapProviderError",
+    "MapProviderNotConfigured",
+    "MapProviderUnavailable",
+    "MapService",
+    "MapplsService",
+    "NoRouteFoundError",
+    "OlaMapsService",
+    "PlaceDetails",
+    "PlaceSuggestion",
+    "ProviderRateLimitedError",
+    "ProviderTimeoutError",
+    "TTLCache",
+    "_TTLCache",
+    "get_map_service",
+    "map_service_status",
+    "run_async",
+    "validate_coordinates",
+]
 
 
 # ======================================================================
@@ -267,7 +183,9 @@ class MapplsService:
             raise MapProviderError("Mappls returned a malformed response") from exc
 
     # -- places --------------------------------------------------------
-    async def autosuggest(self, query: str, limit: int = 8) -> list[PlaceSuggestion]:
+    async def autosuggest(
+        self, query: str, limit: int = 8, session_token: str | None = None
+    ) -> list[PlaceSuggestion]:
         self._require_config()
         query = (query or "").strip()
         if len(query) < 3:
@@ -325,7 +243,9 @@ class MapplsService:
             )
         return out
 
-    async def place_details(self, place_id: str) -> PlaceDetails:
+    async def place_details(
+        self, place_id: str, session_token: str | None = None
+    ) -> PlaceDetails:
         self._require_config()
         if not place_id:
             raise MapProviderError("A place id is required")
@@ -511,7 +431,9 @@ class OlaMapsService:
         except ValueError as exc:
             raise MapProviderError("Ola Maps returned a malformed response") from exc
 
-    async def autosuggest(self, query: str, limit: int = 8) -> list[PlaceSuggestion]:
+    async def autosuggest(
+        self, query: str, limit: int = 8, session_token: str | None = None
+    ) -> list[PlaceSuggestion]:
         self._require_config()
         query = (query or "").strip()
         if len(query) < 3:
@@ -534,7 +456,9 @@ class OlaMapsService:
             )
         return out
 
-    async def place_details(self, place_id: str) -> PlaceDetails:
+    async def place_details(
+        self, place_id: str, session_token: str | None = None
+    ) -> PlaceDetails:
         self._require_config()
         data = await self._get_json(
             f"{OLA_MAPS_BASE_URL}/places/v1/details",
@@ -642,44 +566,30 @@ _instances: dict[str, object] = {}
 
 
 def get_map_service() -> MapService:
-    """Return the configured map provider.
+    """Return the active Google Maps provider.
 
-    Raises MapProviderNotConfigured when no credentials are present so callers
-    can respond with an honest 503 instead of silently returning fake distances.
+    Google Maps is the only active provider. No Mappls/Ola/OSRM fallback is used.
+    Raises MapProviderNotConfigured when Google credentials are missing.
     """
-    provider = MAP_PROVIDER
-
-    if provider == "mappls":
-        service = _instances.get("mappls") or MapplsService()
-        if not service.is_configured():
-            raise MapProviderNotConfigured(
-                "Location services are not configured yet. Please contact support."
-            )
-        _instances["mappls"] = service
-        return service  # type: ignore[return-value]
-
-    if provider == "ola":
-        service = _instances.get("ola") or OlaMapsService()
-        if not service.is_configured():
-            raise MapProviderNotConfigured(
-                "Location services are not configured yet. Please contact support."
-            )
-        _instances["ola"] = service
-        return service  # type: ignore[return-value]
-
-    raise MapProviderNotConfigured(
-        "Location services are unavailable. Please contact support."
-    )
+    provider = "google"
+    service = _instances.get(provider)
+    if service is None:
+        service = GoogleMapsService()
+        _instances[provider] = service
+    if not service.is_configured():
+        raise GoogleNotConfiguredError(
+            "Location services are not configured yet. Please contact support."
+        )
+    return service  # type: ignore[return-value]
 
 
 def map_service_status() -> dict:
     """Diagnostics for /health and the admin settings screen."""
+    configured = bool(GOOGLE_MAPS_API_KEY)
     return {
-        "provider": MAP_PROVIDER,
-        "configured": MAP_PROVIDER in ("mappls", "ola")
-        and (
-            MapplsService.is_configured() if MAP_PROVIDER == "mappls" else OlaMapsService.is_configured()
-        ),
-        "key_present": bool(MAPPLS_API_KEY or OLA_MAPS_API_KEY),
+        "provider": "google",
+        "configured": configured,
+        "key_present": configured,
+        "google_only": True,
         "debug": DEBUG,
     }

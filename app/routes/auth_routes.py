@@ -84,7 +84,11 @@ def _build_auth_response(db: Session, user: User) -> AuthResponse:
     current = SubscriptionService.current(db, user.id)
     return AuthResponse(
         access_token=create_access_token(
-            {"user_id": user.id, "role": user.role.value}
+            {
+                "user_id": user.id,
+                "role": user.role.value,
+                "tv": int(getattr(user, "token_version", 0) or 0),
+            }
         ),
         user_id=user.id,
         role=user.role.value,
@@ -262,20 +266,21 @@ def email_login(payload: VerifyEmailOTPRequest, db: Session = Depends(get_db)) -
         raise HTTPException(
             status_code=403, detail="This account has been suspended. Please contact support."
         )
-    proof = (
-        db.query(OTPVerification)
-        .filter(
-            OTPVerification.email == email,
-            OTPVerification.purpose == OTPPurpose.email_login,
-            OTPVerification.verified.is_(True),
-        )
-        .order_by(OTPVerification.id.desc())
-        .first()
-    )
-    if proof is None:
-        _record = OTPService.verify_email(db, email, payload.otp, purpose=OTPPurpose.email_login)
-    else:
-        _record = proof
+    # Never authenticate from the existence of an old "verified" row.  The
+    # submitted code must be checked against the newest active OTP for this
+    # email; purpose, expiry, single-use and atomic consumption are enforced
+    # by OTPService.verify_email.
+    try:
+        OTPService.verify_email(db, email, payload.otp, purpose=OTPPurpose.email_login)
+    except HTTPException as exc:
+        # Generic authentication errors: never reveal which check failed or
+        # whether the email address is registered.
+        if exc.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many attempts. Request a new verification code.",
+            )
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
     if not user.password_hash and not user.is_verified:
         raise HTTPException(status_code=400, detail="Complete registration first")
     user.auth_provider = AuthProvider.email_otp
@@ -555,6 +560,17 @@ def me(current_user: User = Depends(get_current_user), db: Session = Depends(get
     }
 
 
+@router.post("/logout")
+def logout(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Invalidate all active tokens for this user."""
+    current_user.token_version = int(getattr(current_user, "token_version", 0) or 0) + 1
+    db.commit()
+    return {"message": "Logged out"}
+
+
 @router.put("/username")
 def change_username(
     payload: ChangeUsernameRequest,
@@ -619,8 +635,9 @@ def change_password(
         raise HTTPException(status_code=400, detail=problem)
 
     current_user.password_hash = hash_password(payload.new_password)
+    current_user.token_version = int(getattr(current_user, "token_version", 0) or 0) + 1
     db.commit()
-    return {"message": "Password updated successfully"}
+    return {"message": "Password updated successfully. Please sign in again."}
 
 
 # ======================================================================
@@ -654,31 +671,22 @@ class ResetPasswordRequest(PhoneOnly):
 def forgot_password_reset(payload: ResetPasswordRequest, db: Session = Depends(get_db)) -> dict:
     phone = normalise_phone(payload.phone_number)
     user = db.query(User).filter(User.phone_number == phone).first()
-    if user is None:
+    if user is None or not user.password_hash:
+        # Do not reveal whether the number is registered or passwordless.
         raise HTTPException(status_code=400, detail="Request a new verification code")
 
-    proof = (
-        db.query(OTPVerification)
-        .filter(
-            OTPVerification.phone_number == phone,
-            OTPVerification.purpose == OTPPurpose.reset_password,
-        )
-        .order_by(OTPVerification.id.desc())
-        .first()
+    OTPService.verify(
+        db,
+        phone,
+        payload.otp,
+        purpose=OTPPurpose.reset_password,
     )
-    if proof is None:
-        raise HTTPException(status_code=400, detail="Request a new verification code")
-
-    from app.utils.security import verify_otp as verify_otp_hash
-
-    if not verify_otp_hash(payload.otp, proof.otp_hash) or proof.is_expired():
-        raise HTTPException(status_code=400, detail="That code is not correct or has expired")
 
     problem = _password_problem(payload.new_password)
     if problem:
         raise HTTPException(status_code=400, detail=problem)
 
     user.password_hash = hash_password(payload.new_password)
-    proof.is_used = True
+    user.token_version = int(getattr(user, "token_version", 0) or 0) + 1
     db.commit()
     return {"message": "Password updated. You can now sign in."}

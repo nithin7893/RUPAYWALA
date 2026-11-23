@@ -23,6 +23,7 @@ from io import BytesIO
 import segno
 from fastapi import HTTPException
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import (
@@ -35,6 +36,7 @@ from app.models.payment import Payment, PaymentStatus, PaymentType
 from app.models.service_request import RequestStatus
 from app.models.subscription_plan import SubscriptionPlan
 from app.models.user import User
+from app.services.quote_service import QuoteService
 from app.services.request_status_service import RequestStatusService
 from app.services.subscription_service import SubscriptionService
 
@@ -75,12 +77,12 @@ class PaymentService:
         existing = PaymentService._reusable_intent(
             db,
             user_id=user.id,
+            payment_type=PaymentType.subscription,
             plan_id=plan.id,
             idempotency_key=idempotency_key,
         )
         if existing is not None:
-            url = build_upi_url(existing.amount, existing.txn_id, plan.plan_name[:40])
-            return existing, plan, url, generate_qr_code_base64(url)
+            return PaymentService._subscription_response(existing, plan)
 
         now = datetime.utcnow()
         txn_id = str(uuid.uuid4())
@@ -102,9 +104,33 @@ class PaymentService:
             expires_at=now + timedelta(minutes=QR_EXPIRY_MINUTES),
         )
         db.add(payment)
-        db.commit()
-        db.refresh(payment)
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent request with the same (user, type, key) won the
+            # unique index. Return the winner instead of a duplicate intent.
+            db.rollback()
+            existing = PaymentService._reusable_intent(
+                db,
+                user_id=user.id,
+                payment_type=PaymentType.subscription,
+                plan_id=plan.id,
+                idempotency_key=idempotency_key,
+            )
+            if existing is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This payment request conflicts with another one. Please try again.",
+                )
+            return PaymentService._subscription_response(existing, plan)
 
+        db.refresh(payment)
+        return PaymentService._subscription_response(payment, plan)
+
+    @staticmethod
+    def _subscription_response(
+        payment: Payment, plan: SubscriptionPlan
+    ) -> tuple[Payment, SubscriptionPlan, str, str]:
         url = build_upi_url(payment.amount, payment.txn_id, plan.plan_name[:40])
         return payment, plan, url, generate_qr_code_base64(url)
 
@@ -114,86 +140,202 @@ class PaymentService:
     ) -> tuple[Payment, str, str]:
         from app.models.service_request import ServiceRequest
 
-        request = db.get(ServiceRequest, request_id)
+        # Lock the request for the whole intent decision. Two concurrent calls
+        # for the same request are serialised here; the second one observes the
+        # committed intent and reuses it instead of creating a duplicate.
+        request = (
+            db.query(ServiceRequest)
+            .filter(ServiceRequest.id == request_id)
+            .with_for_update()
+            .first()
+        )
         if request is None or request.user_id != user.id:
             raise HTTPException(status_code=404, detail="Service request not found")
+        if request.status in (RequestStatus.cancelled, RequestStatus.completed):
+            raise HTTPException(
+                status_code=409, detail="This request can no longer be paid"
+            )
         if not request.requires_payment:
             raise HTTPException(
                 status_code=400, detail="There is no pending extra charge on this request"
             )
+        if request.status != RequestStatus.payment_pending:
+            raise HTTPException(
+                status_code=409,
+                detail="This request is not awaiting an extra-charge payment",
+            )
+
+        # Use the single authoritative quote/legacy classification. A tampered
+        # or inconsistent association can never downgrade to the legacy path.
+        quote = QuoteService.request_pricing_authority(db, request=request)
+        if quote is not None:
+            amount_source = quote
+            currency = quote.currency or "INR"
+        else:
+            amount_source = request
+            currency = "INR"
+
+        total = _q(amount_source.total_amount or 0)
+        if total <= 0:
+            raise HTTPException(
+                status_code=400, detail="There is no payable amount on this request"
+            )
 
         existing = PaymentService._reusable_intent(
-            db, user_id=user.id, request_id=request_id
+            db,
+            user_id=user.id,
+            payment_type=PaymentType.extra_charge,
+            request_id=request_id,
         )
         if existing is not None:
-            url = build_upi_url(existing.amount, existing.txn_id, f"Request {request_id}")
-            return existing, url, generate_qr_code_base64(url)
+            return PaymentService._extra_charge_response(existing, request_id)
 
         now = datetime.utcnow()
         txn_id = str(uuid.uuid4())
-        total = _q(request.total_amount or 0)
 
         payment = Payment(
             txn_id=txn_id,
             user_id=user.id,
             payment_type=PaymentType.extra_charge,
             related_request_id=request_id,
-            base_amount=_q(request.base_amount or 0),
-            extra_charge=_q(request.extra_charge or 0),
-            tax_amount=_q(request.tax_amount or 0),
+            base_amount=_q(amount_source.base_amount or 0),
+            extra_charge=_q(amount_source.extra_charge or 0),
+            tax_amount=_q(amount_source.tax_amount or 0),
             amount=total,
-            currency="INR",
+            currency=currency,
             status=PaymentStatus.pending,
             idempotency_key=f"request:{request_id}",
             qr_generated_at=now,
             expires_at=now + timedelta(minutes=QR_EXPIRY_MINUTES),
         )
         db.add(payment)
-        db.commit()
-        db.refresh(payment)
+        try:
+            db.commit()
+        except IntegrityError:
+            # The database-level partial unique index is the final guard: even
+            # if a lock was bypassed, only one open extra-charge intent exists.
+            db.rollback()
+            existing = PaymentService._reusable_intent(
+                db,
+                user_id=user.id,
+                payment_type=PaymentType.extra_charge,
+                request_id=request_id,
+            )
+            if existing is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A payment is already open for this request",
+                )
+            return PaymentService._extra_charge_response(existing, request_id)
 
+        db.refresh(payment)
+        return PaymentService._extra_charge_response(payment, request_id)
+
+    @staticmethod
+    def _extra_charge_response(payment: Payment, request_id: int) -> tuple[Payment, str, str]:
         url = build_upi_url(payment.amount, payment.txn_id, f"Request {request_id}")
         return payment, url, generate_qr_code_base64(url)
+
+    _OPEN_STATUSES = (PaymentStatus.pending, PaymentStatus.pending_verification)
 
     @staticmethod
     def _reusable_intent(
         db: Session,
         *,
         user_id: int,
+        payment_type: PaymentType,
         plan_id: int | None = None,
         request_id: int | None = None,
         idempotency_key: str | None = None,
     ) -> Payment | None:
-        """Return an open payment for the same purpose, or None."""
+        """Return an existing payment for the same customer and purpose, or None.
+
+        Every lookup is scoped to ``user_id`` so an idempotency key can never
+        resolve to another customer's transaction, QR or amount.
+
+        When an idempotency key is supplied, it is the primary identity of the
+        operation: any existing payment with the same (user, type, key) is
+        returned idempotently, regardless of terminal status, and a key reused
+        for a different logical target is rejected. This prevents silent creation
+        of a second payment intent for the same keyed operation.
+        """
+        now = datetime.utcnow()
+
         if idempotency_key:
-            existing = (
+            keyed = (
                 db.query(Payment)
                 .filter(
+                    Payment.user_id == user_id,
+                    Payment.payment_type == payment_type,
                     Payment.idempotency_key == idempotency_key,
-                    Payment.status.in_([PaymentStatus.pending, PaymentStatus.pending_verification]),
                 )
-                .first()
+                .order_by(Payment.id.desc())
+                .all()
             )
-            if existing is not None:
-                if existing.status == PaymentStatus.pending and existing.expires_at < datetime.utcnow():
-                    existing.status = PaymentStatus.expired
-                    db.commit()
-                    return None
-                return existing
+            if keyed:
+                # Payload mismatch: same key must not be reused for a different
+                # logical payment operation.
+                for existing in keyed:
+                    if plan_id is not None and existing.plan_id != plan_id:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="This idempotency key has already been used for a different payment request",
+                        )
+                    if request_id is not None and existing.related_request_id != request_id:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="This idempotency key has already been used for a different payment request",
+                        )
+
+                # Prefer an open intent for the same key; otherwise return the
+                # most recent terminal payment so retries do not silently create
+                # a second intent for the same logical operation.
+                open_keyed = [p for p in keyed if p.status in PaymentService._OPEN_STATUSES]
+                if open_keyed:
+                    existing = open_keyed[0]
+                    if existing.status == PaymentStatus.pending and existing.expires_at < now:
+                        existing.status = PaymentStatus.expired
+                        db.commit()
+                        db.refresh(existing)
+                    return existing
+                return keyed[0]
+
+            # No key match found. Do not return an unrelated open intent as if it
+            # belonged to this idempotency key, but do prevent duplicate open
+            # intents for the same logical target.
+            conflict = db.query(Payment).filter(
+                Payment.user_id == user_id,
+                Payment.payment_type == payment_type,
+                Payment.status.in_(PaymentService._OPEN_STATUSES),
+            )
+            if plan_id is not None:
+                conflict = conflict.filter(Payment.plan_id == plan_id)
+            if request_id is not None:
+                conflict = conflict.filter(Payment.related_request_id == request_id)
+            for candidate in conflict.order_by(Payment.id.desc()).limit(5).all():
+                if candidate.status == PaymentStatus.pending_verification:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A payment for this is already awaiting verification",
+                    )
+                if candidate.expires_at >= now:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="An open payment already exists for this request. Submit or wait for it to expire before creating a new one.",
+                    )
+                candidate.status = PaymentStatus.expired
+                db.commit()
+            return None
 
         query = db.query(Payment).filter(
             Payment.user_id == user_id,
-            Payment.status.in_([PaymentStatus.pending, PaymentStatus.pending_verification]),
+            Payment.payment_type == payment_type,
+            Payment.status.in_(PaymentService._OPEN_STATUSES),
         )
         if plan_id is not None:
-            query = query.filter(
-                Payment.plan_id == plan_id, Payment.payment_type == PaymentType.subscription
-            )
+            query = query.filter(Payment.plan_id == plan_id)
         if request_id is not None:
-            query = query.filter(
-                Payment.related_request_id == request_id,
-                Payment.payment_type == PaymentType.extra_charge,
-            )
+            query = query.filter(Payment.related_request_id == request_id)
 
         for candidate in query.order_by(Payment.id.desc()).limit(5).all():
             if candidate.status == PaymentStatus.pending_verification:
@@ -201,7 +343,7 @@ class PaymentService:
                     status_code=409,
                     detail="A payment for this is already awaiting verification",
                 )
-            if candidate.expires_at >= datetime.utcnow():
+            if candidate.expires_at >= now:
                 return candidate
             candidate.status = PaymentStatus.expired
             db.commit()
@@ -248,13 +390,11 @@ class PaymentService:
         if len(utr) < 6 or len(utr) > 50:
             raise HTTPException(status_code=400, detail="Enter a valid UTR / reference number")
 
+        # The database enforces a global unique UTR across *every* status, so
+        # the pre-check must cover every status too - not only successful rows.
         clash = (
             db.query(Payment)
-            .filter(
-                Payment.utr_number == utr,
-                Payment.id != payment.id,
-                Payment.status == PaymentStatus.success,
-            )
+            .filter(Payment.utr_number == utr, Payment.id != payment.id)
             .first()
         )
         if clash is not None:
@@ -266,7 +406,16 @@ class PaymentService:
         payment.utr_number = utr
         payment.attempts = (payment.attempts or 0) + 1
         payment.status = PaymentStatus.pending_verification
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent submission claimed the same UTR between our check
+            # and the commit. Roll back and return a safe conflict, never a 500.
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="That reference number has already been used for another payment",
+            )
         db.refresh(payment)
         return payment
 
@@ -302,6 +451,12 @@ class PaymentService:
             db.refresh(payment)
             return payment
 
+        # Revalidate eligibility *before* anything is activated. A cancelled or
+        # completed request, a tampered quote-backed price or a currency change
+        # must never be turned into a successful charge.
+        if payment.payment_type == PaymentType.extra_charge:
+            PaymentService._validate_extra_charge_approval(db, payment)
+
         payment.status = PaymentStatus.success
 
         if payment.payment_type == PaymentType.extra_charge:
@@ -312,6 +467,55 @@ class PaymentService:
         db.commit()
         db.refresh(payment)
         return payment
+
+    @staticmethod
+    def _validate_extra_charge_approval(db: Session, payment: Payment) -> None:
+        """Lock the request and re-check every precondition for approval."""
+        from app.models.service_request import ServiceRequest
+
+        request = (
+            db.query(ServiceRequest)
+            .filter(ServiceRequest.id == payment.related_request_id)
+            .with_for_update()
+            .first()
+        )
+        if request is None:
+            raise HTTPException(
+                status_code=409, detail="The related service request no longer exists"
+            )
+        if request.user_id != payment.user_id:
+            raise HTTPException(
+                status_code=409, detail="The related service request belongs to another customer"
+            )
+        if request.status in (RequestStatus.cancelled, RequestStatus.completed):
+            raise HTTPException(
+                status_code=409, detail="This request can no longer accept a payment"
+            )
+        if request.status != RequestStatus.payment_pending:
+            raise HTTPException(
+                status_code=409, detail="This request is not awaiting an extra-charge payment"
+            )
+        if request.charge_paid:
+            raise HTTPException(
+                status_code=409, detail="The extra charge on this request is already paid"
+            )
+
+        quote = QuoteService.request_pricing_authority(db, request=request)
+        if quote is None:
+            # Genuine legacy request without any quote association keeps its
+            # existing behaviour.
+            return
+
+        if _q(payment.amount or 0) != _q(quote.total_amount or 0):
+            raise HTTPException(
+                status_code=409,
+                detail="The payment amount does not match the quotation. Please contact support.",
+            )
+        if (payment.currency or "").upper() != (quote.currency or "").upper():
+            raise HTTPException(
+                status_code=409,
+                detail="The payment currency does not match the quotation. Please contact support.",
+            )
 
     @staticmethod
     def _activate_extra_charge(db: Session, payment: Payment) -> None:
@@ -325,12 +529,15 @@ class PaymentService:
         )
         if request is None:
             raise HTTPException(status_code=409, detail="The related service request no longer exists")
+        if request.status != RequestStatus.payment_pending or request.charge_paid:
+            raise HTTPException(
+                status_code=409, detail="This request is no longer awaiting an extra-charge payment"
+            )
 
         request.charge_paid = True
-        if request.status == RequestStatus.payment_pending:
-            RequestStatusService.ensure_transition(request, RequestStatus.payment_completed)
-            if request.status == RequestStatus.payment_completed:
-                request.status = RequestStatus.waiting_for_assignment
+        RequestStatusService.ensure_transition(request, RequestStatus.payment_completed)
+        if request.status == RequestStatus.payment_completed:
+            request.status = RequestStatus.waiting_for_assignment
 
     @staticmethod
     def _activate_subscription(db: Session, payment: Payment) -> None:

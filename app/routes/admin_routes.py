@@ -630,14 +630,45 @@ def update_user_role(
 # ======================================================================
 # 5. Branches
 # ======================================================================
-def _geocode(address: str):
-    """Best-effort geocode for a branch address."""
+def _branch_address_for_geocode(
+    address: str, city: str | None = None, state: str | None = None, pincode: str | None = None
+) -> str:
+    parts = [address]
+    if city:
+        parts.append(city)
+    if state:
+        parts.append(state)
+    if pincode:
+        parts.append(pincode)
+    return ", ".join(str(p).strip() for p in parts if p and str(p).strip())
+
+
+def _geocode_branch_address(address: str):
+    """Resolve a branch address to coordinates via the active map provider."""
     try:
         service = maps.get_map_service()
         return maps.run_async(service.geocode_address(address))
-    except (maps.MapProviderNotConfigured, maps.MapProviderError, maps.MapProviderUnavailable) as exc:
-        logger.warning("Could not geocode branch address: %s", exc)
-        return None
+    except maps.MapProviderNotConfigured as exc:
+        logger.warning("Branch geocoding unavailable: provider not configured")
+        raise HTTPException(status_code=503, detail=str(exc))
+    except maps.MapProviderUnavailable as exc:
+        logger.warning("Branch geocoding unavailable: provider unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="Location service is temporarily unavailable. Please try again later.",
+        )
+    except (maps.MapProviderError, ValueError) as exc:
+        logger.warning("Branch geocoding failed: %s", exc.__class__.__name__)
+        message = str(exc).strip() or "Could not resolve this address to coordinates."
+        raise HTTPException(status_code=400, detail=message)
+
+
+def _validate_branch_coordinates(latitude: float, longitude: float) -> tuple[float, float]:
+    try:
+        maps.validate_coordinates(latitude, longitude, "branch location")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return float(latitude), float(longitude)
 
 
 @router.get("/branches", response_model=list[BranchResponse])
@@ -652,17 +683,18 @@ def create_branch(
     admin: User = Depends(admin_required),
 ):
     latitude, longitude = payload.latitude, payload.longitude
-    if latitude is None or longitude is None:
-        geo = _geocode(f"{payload.address}, {payload.city or ''} {payload.state or ''}".strip(", "))
-        if geo is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Could not resolve this address to coordinates. Provide latitude and "
-                    "longitude explicitly."
-                ),
-            )
+    if latitude is not None and longitude is not None:
+        latitude, longitude = _validate_branch_coordinates(latitude, longitude)
+    elif latitude is None and longitude is None:
+        geo = _geocode_branch_address(
+            _branch_address_for_geocode(payload.address, payload.city, payload.state, payload.pincode)
+        )
         latitude, longitude = geo.latitude, geo.longitude
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide both latitude and longitude, or omit both to geocode the address.",
+        )
 
     branch = Branch(
         name=payload.name,
@@ -692,13 +724,40 @@ def update_branch(
     if branch is None:
         raise HTTPException(status_code=404, detail="Branch not found")
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(branch, field, value)
+    updates = payload.model_dump(exclude_unset=True)
 
-    if payload.address and (payload.latitude is None and payload.longitude is None):
-        geo = _geocode(payload.address)
-        if geo is not None:
-            branch.latitude, branch.longitude = geo.latitude, geo.longitude
+    new_address = updates.get("address", branch.address)
+    new_city = updates.get("city", branch.city)
+    new_state = updates.get("state", branch.state)
+    new_pincode = updates.get("pincode", branch.pincode)
+
+    explicit_lat = "latitude" in updates
+    explicit_lng = "longitude" in updates
+    address_changed = "address" in updates and str(updates["address"]).strip() != str(branch.address or "").strip()
+
+    # Determine coordinates for the updated branch without mutating the persisted
+    # record until validation/geocoding succeeds.
+    if explicit_lat or explicit_lng:
+        if not (explicit_lat and explicit_lng):
+            raise HTTPException(
+                status_code=400,
+                detail="Provide both latitude and longitude when updating coordinates explicitly.",
+            )
+        latitude, longitude = _validate_branch_coordinates(
+            updates["latitude"], updates["longitude"]
+        )
+    elif address_changed:
+        geo = _geocode_branch_address(
+            _branch_address_for_geocode(new_address, new_city, new_state, new_pincode)
+        )
+        latitude, longitude = geo.latitude, geo.longitude
+    else:
+        latitude, longitude = float(branch.latitude), float(branch.longitude)
+
+    # Apply all requested field updates only after coordinates are resolved.
+    for field, value in updates.items():
+        setattr(branch, field, value)
+    branch.latitude, branch.longitude = latitude, longitude
 
     db.commit()
     db.refresh(branch)

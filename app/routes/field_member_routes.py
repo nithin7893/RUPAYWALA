@@ -33,7 +33,7 @@ from app.services.notification_service import NotificationService
 from app.services.request_status_service import RequestStatusService
 from app.services.visit_service import VisitService
 from app.utils.dependencies import get_approved_field_member
-from app.utils.upload_service import save_upload
+from app.services.document_service import DocumentService
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,7 @@ def _job_response(db: Session, request: ServiceRequest, assignment: RequestAssig
         distance_km=float(request.distance_km) if request.distance_km else None,
         completion_notes=request.completion_notes,
         proof_image_url=request.proof_image_url,
+        proof_document_id=request.proof_document_id,
         assigned_at=assignment.assigned_at,
         started_at=request.started_at,
         completed_at=request.completed_at,
@@ -368,7 +369,15 @@ def complete_request(
         )
 
     if proof is not None and proof.filename:
-        request.proof_image_url = save_upload(proof, subdir=f"proof/user_{request.user_id}")
+        doc = DocumentService.store_document(
+            db,
+            file=proof,
+            owner_id=request.user_id,
+            actor_user_id=user.id,
+            document_type="service_proof",
+        )
+        request.proof_document_id = doc.id
+        request.proof_image_url = f"/documents/{doc.id}/content"
 
     RequestStatusService.mark_completed(request)
     request.completion_notes = completion_notes.strip()

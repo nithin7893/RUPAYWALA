@@ -35,6 +35,10 @@ typing_extensions==4.15.0
 uvicorn==0.41.0
 segno==1.6.6
 
+# --- private document storage / malware scan (Stage 5.6J, optional by provider) ---
+boto3>=1.34.0
+clamd>=1.0.2
+
 # --- test suite ---
 iniconfig==2.3.0
 packaging==26.3
